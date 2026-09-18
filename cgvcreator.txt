@@ -65,26 +65,42 @@ function makeAgent() {
     return proxy ? new HttpsProxyAgent(proxy) : undefined;
 }
 
+// ─── CapSolver: buat task ─────────────────────────────────────────────────────
 const functionGetTokenAction = (sitekey, linkAccess, version) =>
     new Promise((resolve, reject) => {
         fetch(
-                `http://2captcha.com/in.php?key=${keyCaptcha}&method=userrecaptcha&googlekey=${sitekey}&pageurl=${linkAccess}&json=1`, {
-                    method: "get",
+                `https://api.capsolver.com/createTask`, {
+                    method: "post",
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        clientKey: keyCaptcha,
+                        task: {
+                            type: "ReCaptchaV2TaskProxyLess",
+                            websiteURL: linkAccess,
+                            websiteKey: sitekey
+                        }
+                    })
                 }
             )
             .then((res) => res.json())
             .then((data) => {
-                if (data.status === 1) resolve(data.request);
-                else reject(new Error(data.request || 'Failed to submit captcha'));
+                if (data.errorId === 0 && data.taskId) resolve(data.taskId);
+                else reject(new Error(data.errorDescription || data.errorCode || 'Failed to submit captcha'));
             })
             .catch((err) => reject(err));
     });
 
-const functionGetRealTokenAction = (id) =>
+// ─── CapSolver: ambil hasil task ──────────────────────────────────────────────
+const functionGetRealTokenAction = (taskId) =>
     new Promise((resolve, reject) => {
         fetch(
-                `http://2captcha.com/res.php?key=${keyCaptcha}&action=get&json=1&id=${id}`, {
-                    method: "get",
+                `https://api.capsolver.com/getTaskResult`, {
+                    method: "post",
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        clientKey: keyCaptcha,
+                        taskId: taskId
+                    })
                 }
             )
             .then((res) => res.json())
@@ -95,37 +111,42 @@ const functionGetRealTokenAction = (id) =>
     });
 
 async function solveRecaptcha(sitekey = "6LdPw1kUAAAAANnq6qTKBXXUyFzbZbjXdQkZt_4m", linkAccess = "https://www.mpj.id/en/user/login") {
-    console.log(chalk.yellow('[Captcha] Submitting task to 2captcha...'));
-    const requestId = await functionGetTokenAction(sitekey, linkAccess, "v2");
-    console.log(chalk.yellow(`[Captcha] Task ID: ${requestId}. Polling for token...`));
+    console.log(chalk.yellow('[Captcha] Submitting task to CapSolver...'));
+    const taskId = await functionGetTokenAction(sitekey, linkAccess, "v2");
+    console.log(chalk.yellow(`[Captcha] Task ID: ${taskId}. Polling for token...`));
 
     for (let attempt = 0; attempt < 25; attempt++) {
         await new Promise(r => setTimeout(r, 5000));
-        const res = await functionGetRealTokenAction(requestId);
-        if (res.status === 1) {
+        const res = await functionGetRealTokenAction(taskId);
+        if (res.errorId !== 0) {
+            throw new Error(`CapSolver error: ${res.errorDescription || res.errorCode}`);
+        }
+        if (res.status === "ready") {
             console.log(chalk.green('[Captcha] ✅ Solved successfully!'));
-            return res.request;
+            return res.solution.gRecaptchaResponse;
         }
-        if (res.request !== "CAPCHA_NOT_READY") {
-            throw new Error(`2captcha error: ${res.request}`);
-        }
+        // status "processing" — masih diproses, tunggu lagi
         process.stdout.write(chalk.gray('.'));
     }
-    throw new Error('2captcha timed out (>125s)');
+    throw new Error('CapSolver timed out (>125s)');
 }
 
 async function checkCaptchaBalance() {
     try {
-        const res = await fetch(`http://2captcha.com/res.php?key=${keyCaptcha}&action=getbalance&json=1`);
+        const res = await fetch(`https://api.capsolver.com/getBalance`, {
+            method: 'post',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ clientKey: keyCaptcha })
+        });
         const data = await res.json();
-        if (data.status === 1) {
-            console.log(chalk.green(`[2Captcha] Saldo 2captcha: $${data.request}`));
-            return parseFloat(data.request);
+        if (data.errorId === 0) {
+            console.log(chalk.green(`[CapSolver] Saldo CapSolver: $${data.balance}`));
+            return parseFloat(data.balance);
         } else {
-            console.log(chalk.red(`[2Captcha] Gagal cek saldo: ${data.request || JSON.stringify(data)}`));
+            console.log(chalk.red(`[CapSolver] Gagal cek saldo: ${data.errorDescription || JSON.stringify(data)}`));
         }
     } catch (err) {
-        console.log(chalk.red(`[2Captcha] Error cek saldo: ${err.message}`));
+        console.log(chalk.red(`[CapSolver] Error cek saldo: ${err.message}`));
     }
     return null;
 }
@@ -717,11 +738,11 @@ function readOtpFromEmail(body) {
             if (regRes && regRes.status === true) {
                 const mbr = regRes.MBR_CRD_NO || '-';
 
-                // 8. Login setelah register berhasil (solve captcha dulu via 2captcha)
+                // 8. Login setelah register berhasil (solve captcha dulu via CapSolver)
                 let loginToken = '-';
                 let loginOk = false;
                 try {
-                    console.log(chalk.blue('[mpj] Solving captcha for login via 2captcha...'));
+                    console.log(chalk.blue('[mpj] Solving captcha for login via CapSolver...'));
                     const captchaResponse = await solveRecaptcha("6LdPw1kUAAAAANnq6qTKBXXUyFzbZbjXdQkZt_4m", "https://www.mpj.id/en/user/login");
                     console.log(chalk.blue('[mpj] Logging in with captcha token...'));
                     const loginRes = await loginmpj(cookie, csrf, email, "dowercorp@123", captchaResponse);
