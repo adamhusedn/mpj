@@ -1,0 +1,6 @@
+{
+  "keyCaptcha": "key2captcha",
+  "proxies": [
+    "username:password@host:port"
+  ]
+}

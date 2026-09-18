@@ -1,0 +1,810 @@
+const readlineSync = require("readline-sync");
+const fs = require("fs");
+var fetch = require("node-fetch");
+var chalk = require("chalk");
+const cheerio = require('cheerio');
+const pLimit = require('p-limit');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+
+const limit = pLimit(5);
+
+// ─── User-Agent pool ─────────────────────────────────────────────────────────
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0',
+];
+function randomUA() {
+    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+// ─── Configuration Loader ───────────────────────────────────────────────────
+let config = {
+    keyCaptcha: "",
+    proxies: []
+};
+
+try {
+    const rawConfig = fs.readFileSync('./configmpj.json', 'utf8');
+    config = { ...config, ...JSON.parse(rawConfig) };
+    console.log(chalk.green('[Config] Loaded settings dari configmpj.json'));
+} catch (_) {
+    console.log(chalk.yellow('[Config] configmpj.json tidak ditemukan — menggunakan default'));
+}
+
+console.log()
+var keyCaptcha = config.keyCaptcha || "";
+
+// ─── Proxy pool ──────────────────────────────────────────────────────────────
+let PROXIES = (config.proxies || [])
+    .map(l => String(l).trim())
+    .filter(l => l && !l.startsWith('#'))
+    .map(l => l.includes('://') ? l : `http://${l}`);
+
+if (PROXIES.length) {
+    console.log(chalk.green(`[Proxy] Loaded ${PROXIES.length} proxies dari configmpj.json`));
+} else {
+    console.log(chalk.yellow('[Proxy] Tidak ada proxy di configmpj.json — berjalan tanpa proxy'));
+}
+
+let proxyIndex = 0;
+function getNextProxy() {
+    if (!PROXIES.length) return null;
+    const proxy = PROXIES[proxyIndex % PROXIES.length];
+    proxyIndex++;
+    return proxy;
+}
+
+/** Buat HttpsProxyAgent dari proxy string, atau null jika tidak ada proxy */
+function makeAgent() {
+    const proxy = getNextProxy();
+    return proxy ? new HttpsProxyAgent(proxy) : undefined;
+}
+
+const functionGetTokenAction = (sitekey, linkAccess, version) =>
+    new Promise((resolve, reject) => {
+        fetch(
+                `http://2captcha.com/in.php?key=${keyCaptcha}&method=userrecaptcha&googlekey=${sitekey}&pageurl=${linkAccess}&json=1`, {
+                    method: "get",
+                }
+            )
+            .then((res) => res.json())
+            .then((data) => {
+                if (data.status === 1) resolve(data.request);
+                else reject(new Error(data.request || 'Failed to submit captcha'));
+            })
+            .catch((err) => reject(err));
+    });
+
+const functionGetRealTokenAction = (id) =>
+    new Promise((resolve, reject) => {
+        fetch(
+                `http://2captcha.com/res.php?key=${keyCaptcha}&action=get&json=1&id=${id}`, {
+                    method: "get",
+                }
+            )
+            .then((res) => res.json())
+            .then((text) => {
+                resolve(text);
+            })
+            .catch((err) => reject(err));
+    });
+
+async function solveRecaptcha(sitekey = "6LdPw1kUAAAAANnq6qTKBXXUyFzbZbjXdQkZt_4m", linkAccess = "https://www.mpj.id/en/user/login") {
+    console.log(chalk.yellow('[Captcha] Submitting task to 2captcha...'));
+    const requestId = await functionGetTokenAction(sitekey, linkAccess, "v2");
+    console.log(chalk.yellow(`[Captcha] Task ID: ${requestId}. Polling for token...`));
+
+    for (let attempt = 0; attempt < 25; attempt++) {
+        await new Promise(r => setTimeout(r, 5000));
+        const res = await functionGetRealTokenAction(requestId);
+        if (res.status === 1) {
+            console.log(chalk.green('[Captcha] ✅ Solved successfully!'));
+            return res.request;
+        }
+        if (res.request !== "CAPCHA_NOT_READY") {
+            throw new Error(`2captcha error: ${res.request}`);
+        }
+        process.stdout.write(chalk.gray('.'));
+    }
+    throw new Error('2captcha timed out (>125s)');
+}
+
+async function checkCaptchaBalance() {
+    try {
+        const res = await fetch(`http://2captcha.com/res.php?key=${keyCaptcha}&action=getbalance&json=1`);
+        const data = await res.json();
+        if (data.status === 1) {
+            console.log(chalk.green(`[2Captcha] Saldo 2captcha: $${data.request}`));
+            return parseFloat(data.request);
+        } else {
+            console.log(chalk.red(`[2Captcha] Gagal cek saldo: ${data.request || JSON.stringify(data)}`));
+        }
+    } catch (err) {
+        console.log(chalk.red(`[2Captcha] Error cek saldo: ${err.message}`));
+    }
+    return null;
+}
+
+
+function getCookie() {
+    const agent = makeAgent();
+    const ua = randomUA();
+    const index = fetch('https://www.mpj.id/en', {
+        agent,
+        headers: {
+            'Host': 'www.mpj.id',
+            'Accept-Language': 'id-ID,id;q=0.9',
+            'Upgrade-Insecure-Requests': '1',
+            'User-Agent': ua,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Sec-Fetch-Site': 'cross-site',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-User': '?1',
+            'Sec-Fetch-Dest': 'document',
+            'Referer': 'https://www.google.com/',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Priority': 'u=0, i',
+            'Connection': 'keep-alive'
+        }
+        })
+
+        .then(async (res) => {
+            const data = await res.text();
+            const headers = res.headers.raw()['set-cookie'] || [];
+            return {
+                data,
+                headers
+            }
+        });
+    return index;
+}
+
+function sendEmail(cookie, csrf, email) {
+    const agent = makeAgent();
+    const ua = randomUA();
+    const index = fetch('https://www.mpj.id/api/register/email-otp', {
+        method: 'POST',
+        agent,
+        headers: {
+            'Host': 'www.mpj.id',
+            'X-Csrf-Token': csrf,
+            'Accept-Language': 'id-ID,id;q=0.9',
+            'Content-Type': 'application/json',
+            'User-Agent': ua,
+            'Accept': '*/*',
+            'Origin': 'https://www.mpj.id',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Dest': 'empty',
+            'Referer': 'https://www.mpj.id/en/user/register',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Cookie': cookie
+        },
+        body: JSON.stringify({ 'email': email })
+    })
+        .then(async (res) => {
+            const text = await res.text();
+            const headers = res.headers.raw()['set-cookie'];
+            let data;
+            try { data = JSON.parse(text); }
+            catch (_) { data = { status: false, status_code: res.status, message: 'Non-JSON response (WAF/block)' }; }
+            return { data, headers };
+        });
+    return index;
+}
+
+function loginAccount(email, password, captchaREsponse) {
+    const index = fetch('https://www.mpj.id/en/user/authenticate', {
+            redirect: 'manual',
+            method: 'POST',
+            headers: {
+                'Host': 'www.mpj.id',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:134.0) Gecko/20100101 Firefox/134.0',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'id,en-US;q=0.7,en;q=0.3',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Referer': 'https://www.mpj.id/en/user/login',
+                'Content-Length': '1175',
+                'Origin': 'https://www.mpj.id',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'same-origin',
+                'Sec-Fetch-User': '?1',
+                'Priority': 'u=0, i',
+                'Te': 'trailers'
+            },
+            body: new URLSearchParams({
+                '_token': 'MDOTUgIBgJfJCBI9BOA0q9A6PlxnaJ38YOjn6ztS',
+                'email': email,
+                'password': password,
+                'g-recaptcha-response': captchaREsponse
+            })
+        })
+
+        .then(async (res) => {
+            const data = await res.text();
+            const headers = res.headers.raw()['set-cookie']
+            return {
+                data,
+                headers
+            }
+        });
+    return index;
+}
+
+function checkData(cookie) {
+    const index = fetch('https://www.mpj.id/en/membership/transaction_history', {
+            headers: {
+                'Host': 'www.mpj.id',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:134.0) Gecko/20100101 Firefox/134.0',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'id,en-US;q=0.7,en;q=0.3',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Referer': 'https://www.mpj.id/en/user/login',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'same-origin',
+                'Sec-Fetch-User': '?1',
+                'Priority': 'u=0, i',
+                'Te': 'trailers',
+                'Cookie': cookie
+            }
+        })
+
+        .then(async (res) => {
+            const data = await res.text();
+            return data
+        });
+    return index;
+}
+
+// ─── Random user data generator ─────────────────────────────────────────────
+const FIRST_NAMES = [
+    'Adi', 'Agus', 'Ahmad', 'Alif', 'Amir', 'Andika', 'Anton', 'Apri', 'Arif', 'Asep',
+    'Bagus', 'Bayu', 'Bima', 'Budi', 'Cahya', 'Dani', 'Deva', 'Dian', 'Dimas', 'Eko',
+    'Fajar', 'Farhan', 'Fauzi', 'Firman', 'Galih', 'Gilang', 'Hamid', 'Hendra', 'Heru',
+    'Ilham', 'Imam', 'Indra', 'Irfan', 'Ivan', 'Joko', 'Kurnia', 'Lukman', 'Malik',
+    'Maulana', 'Muhammad', 'Nanda', 'Panji', 'Putra', 'Rahmat', 'Raka', 'Reza', 'Rifki',
+    'Rizki', 'Ryan', 'Saiful', 'Sandy', 'Satria', 'Sigit', 'Taufik', 'Teguh', 'Wahyu',
+    'Wildan', 'Yoga', 'Yogi', 'Yusuf', 'Zainal',
+    // perempuan
+    'Aini', 'Alya', 'Amira', 'Annisa', 'Ayu', 'Bunga', 'Citra', 'Desi', 'Dewi', 'Dinda',
+    'Farida', 'Fatimah', 'Fitri', 'Hana', 'Indah', 'Intan', 'Kartika', 'Lia', 'Linda',
+    'Maya', 'Melati', 'Nadia', 'Novi', 'Nurul', 'Raisya', 'Ratna', 'Rini', 'Riska',
+    'Salsabila', 'Sarah', 'Sinta', 'Siti', 'Tiara', 'Vina', 'Widya', 'Yunita', 'Zahra',
+];
+const LAST_NAMES = [
+    'Amsyah', 'Andrian', 'Arifin', 'Ariyanto', 'Basuki', 'Budiman', 'Cahyono', 'Darmawan',
+    'Efendi', 'Fadillah', 'Fauzan', 'Gunawan', 'Hakim', 'Handoko', 'Haryanto', 'Hermawan',
+    'Hidayat', 'Ibrahim', 'Ismail', 'Junaedi', 'Kurniawan', 'Kusuma', 'Lubis', 'Maulana',
+    'Mulyadi', 'Nasution', 'Nugroho', 'Pamungkas', 'Prasetyo', 'Pratama', 'Rachman',
+    'Rahman', 'Rahmawati', 'Ramadan', 'Riyadi', 'Saputra', 'Setiawan', 'Siregar', 'Sudrajat',
+    'Sugiyanto', 'Suharto', 'Sulaiman', 'Susanto', 'Sutrisno', 'Syahputra', 'Tanjung',
+    'Utomo', 'Wibowo', 'Wicaksono', 'Widodo', 'Wijaya', 'Wirawan', 'Yudha', 'Zainudin',
+];
+
+const PREF_CINEMAS = ['079'];
+
+function rnd(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+function randomUserData(email) {
+    const firstName = pick(FIRST_NAMES);
+    const lastName  = pick(LAST_NAMES);
+    const name      = `${firstName} ${lastName}`;
+
+    // Nomor HP Indonesia: 08xx-xxxx-xxxx
+    const prefixes  = ['0811','0812','0813','0814','0815','0816','0817','0818','0819',
+                       '0821','0822','0823','0852','0853','0856','0857','0858',
+                       '0831','0832','0833','0838','0895','0896','0897','0898','0899'];
+    const mobile_no = pick(prefixes) + String(rnd(10000000, 99999999));
+
+    // Tanggal lahir: 1980–2000, usia min 18 thn
+    const year      = rnd(1980, 2000);
+    const month     = String(rnd(1, 12)).padStart(2, '0');
+    const day       = String(rnd(1, 28)).padStart(2, '0');
+    const birthdate = `${year}${month}${day}`;
+
+    // Gender random
+    const gender    = Math.random() < 0.5 ? '01' : '02';
+
+    // PIN 6 digit
+    const pin       = String(rnd(100000, 999999));
+
+    // Password acak tapi kuat
+    const passWords = ['Dower@corp123','Jangan@lupa321','Nonton@mpj999','Mantap@jiwa456','Cobaan@hidup789'];
+    const password  = pick(passWords);
+
+    // Pref cinema random
+    const pref_cinema = pick(PREF_CINEMAS);
+
+    // Fingerprint 64 hex chars
+    const fingerprint = [...Array(64)].map(() => Math.floor(Math.random()*16).toString(16)).join('');
+
+    return { name, mobile_no, birthdate, gender, pin, password, pref_cinema, fingerprint };
+}
+
+// ─── mpj HTTP: Verify OTP ────────────────────────────────────────────────────
+function verifyOtp(cookie, csrf, email, otp) {
+    const agent = makeAgent();
+    const ua    = randomUA();
+    return fetch('https://www.mpj.id/api/register/email-verify', {
+        method: 'POST',
+        agent,
+        headers: {
+            'Host': 'www.mpj.id',
+            'X-Csrf-Token': csrf,
+            'Accept-Language': 'id-ID,id;q=0.9',
+            'Content-Type': 'application/json',
+            'User-Agent': ua,
+            'Accept': '*/*',
+            'Origin': 'https://www.mpj.id',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Dest': 'empty',
+            'Referer': 'https://www.mpj.id/en/user/register',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Priority': 'u=1, i',
+            'Connection': 'keep-alive',
+            'Cookie': cookie
+        },
+        body: JSON.stringify({ email, otp })
+    }).then(async res => {
+        const text = await res.text();
+        try { return JSON.parse(text); }
+        catch (_) { return { status: false, status_code: res.status, message: 'Non-JSON response (WAF/block)' }; }
+    });
+}
+
+// ─── mpj HTTP: Register Account ──────────────────────────────────────────────
+function registerAccount(cookie, csrf, email, otp, userData) {
+    const agent = makeAgent();
+    const ua    = randomUA();
+    const payload = {
+        otp,
+        name:           userData.name,
+        mobile_no:      userData.mobile_no,
+        pref_cinema:    userData.pref_cinema,
+        gender:         userData.gender,
+        pin:            userData.pin,
+        fingerprint:    userData.fingerprint,
+        email,
+        password:       "dowercorp@123",
+        birthdate:      userData.birthdate,
+        recaptchaToken: ''
+    };
+    return fetch('https://www.mpj.id/api/register', {
+        method: 'POST',
+        agent,
+        headers: {
+            'Host': 'www.mpj.id',
+            'X-Csrf-Token': csrf,
+            'Accept-Language': 'id-ID,id;q=0.9',
+            'Content-Type': 'application/json',
+            'User-Agent': ua,
+            'Accept': '*/*',
+            'Origin': 'https://www.mpj.id',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Dest': 'empty',
+            'Referer': 'https://www.mpj.id/en/user/register',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Priority': 'u=1, i',
+            'Connection': 'keep-alive',
+            'Cookie': cookie
+        },
+        body: JSON.stringify(payload)
+    }).then(async res => {
+        const text = await res.text();
+        try { return JSON.parse(text); }
+        catch (_) { return { status: false, status_code: res.status, message: 'Non-JSON response (WAF/block)' }; }
+    });
+}
+
+// ─── mpj HTTP: Login ───────────────────────────────────────────────────────────
+function loginmpj(cookie, csrf, email, password, recaptchaToken = '') {
+    const agent = makeAgent();
+    const ua    = randomUA();
+    return fetch('https://www.mpj.id/api/login', {
+        method: 'POST',
+        agent,
+        headers: {
+            'Host': 'www.mpj.id',
+            'X-Csrf-Token': csrf,
+            'Accept-Language': 'id-ID,id;q=0.9',
+            'Content-Type': 'application/json',
+            'User-Agent': ua,
+            'Accept': '*/*',
+            'Origin': 'https://www.mpj.id',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Dest': 'empty',
+            'Referer': 'https://www.mpj.id/en/user/register',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Priority': 'u=1, i',
+            'Connection': 'keep-alive',
+            'Cookie': cookie
+        },
+        body: JSON.stringify({ email, password, recaptchaToken })
+    }).then(async res => {
+        const text    = await res.text();
+        const cookies = res.headers.raw()['set-cookie'] || [];
+        let data;
+        try { data = JSON.parse(text); }
+        catch (_) { data = { status: false, status_code: res.status, message: 'Non-JSON response (WAF/block)' }; }
+        return { data, cookies };
+    });
+}
+
+// ─── mpj HTTP: Register Coupon ────────────────────────────────────────────────
+function registerCoupon(cookie, csrf, token, couponNumber) {
+    const agent = makeAgent();
+    const ua    = randomUA();
+    const cleanCookie = cookie
+        .split(';')
+        .map(c => c.trim())
+        .filter(c => !c.startsWith('token='))
+        .join('; ');
+    const authCookie = `${cleanCookie}; token=${token}`;
+    return fetch('https://www.mpj.id/api/coupon/register', {
+        method: 'POST',
+        agent,
+        headers: {
+            'Host': 'www.mpj.id',
+            'X-Csrf-Token': csrf,
+            'Authorization': `Bearer ${token}`,
+            'Accept-Language': 'id-ID,id;q=0.9',
+            'Content-Type': 'application/json',
+            'User-Agent': ua,
+            'Accept': '*/*',
+            'Origin': 'https://www.mpj.id',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Dest': 'empty',
+            'Referer': 'https://www.mpj.id/en/membership/my_coupon',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Priority': 'u=1, i',
+            'Connection': 'keep-alive',
+            'Cookie': authCookie
+        },
+        body: JSON.stringify({ coupon_number: couponNumber })
+    }).then(async res => {
+        const text = await res.text();
+        try { return JSON.parse(text); }
+        catch (_) { return { status: false, status_code: res.status, message: 'Non-JSON response' }; }
+    });
+}
+
+// ─── jestco.id temp email functions ──────────────────────────────────────────
+
+const JESTCO_API = 'https://jestco.id/api.php';
+const JESTCO_HEADERS = {
+    'Host': 'jestco.id',
+    'Sec-Ch-Ua-Platform': '"macOS"',
+    'Accept-Language': 'id-ID,id;q=0.9',
+    'Sec-Ch-Ua': '"Not;A=Brand";v="8", "Chromium";v="150"',
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Accept': '*/*',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Dest': 'empty',
+    'Referer': 'https://jestco.id/',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Priority': 'u=1, i',
+};
+
+// ─── Indonesian name generator ───────────────────────────────────────────────
+const NAMA_DEPAN = [
+    'adi', 'agus', 'ahmad', 'alif', 'amir', 'andika', 'anggara', 'anjar', 'anton', 'apri',
+    'arif', 'arifin', 'arjuna', 'asep', 'bagus', 'bayu', 'bima', 'budi', 'cahya', 'dani',
+    'danu', 'dedy', 'dendi', 'deni', 'deva', 'dewa', 'dian', 'dimas', 'dio', 'dion',
+    'dodi', 'eko', 'elang', 'fajar', 'fakri', 'fandi', 'farel', 'farhan', 'farras', 'fauzi',
+    'ferry', 'fiqri', 'firman', 'galih', 'galang', 'gilang', 'giri', 'hamid', 'handi', 'hendra',
+    'hendy', 'heru', 'ibnu', 'ichsan', 'ilham', 'imam', 'indra', 'irfan', 'irwan', 'ivan',
+    'jaka', 'joko', 'julian', 'julio', 'krisna', 'kukuh', 'kurnia', 'latif', 'lukman',
+    'luqman', 'lutfi', 'mahesa', 'mahfud', 'malik', 'maulana', 'maulidian', 'muammar', 'muchlis', 'muflih',
+    'muhamad', 'muhammad', 'munir', 'murni', 'nanda', 'nanang', 'novan', 'novian', 'nur', 'nurul',
+    'oky', 'panji', 'putra', 'rafi', 'rahmat', 'raka', 'reza', 'rifki', 'riko', 'rizal',
+    'rizki', 'roni', 'ryan', 'saiful', 'sandy', 'sari', 'satria', 'septian', 'setya', 'sigit',
+    'sulaiman', 'taufik', 'teguh', 'tommy', 'topan', 'tri', 'umar', 'wahyu', 'wawan', 'wildan',
+    'wisnu', 'wulandari', 'yoga', 'yogi', 'yusuf', 'zainal', 'zaki', 'zulfikar', 'zulkifli',
+    // nama perempuan
+    'aini', 'alya', 'amira', 'ananda', 'annisa', 'ayu', 'bunga', 'cantika', 'citra', 'dara',
+    'desi', 'dewi', 'dinda', 'elvira', 'erni', 'farida', 'fatimah', 'feni', 'fitri', 'hana',
+    'indah', 'intan', 'kania', 'kartika', 'lestari', 'lia', 'linda', 'lulu', 'maya', 'mela',
+    'melati', 'nadia', 'nisa', 'novi', 'nur', 'nurhayati', 'nurul', 'raisya', 'rara', 'ratna',
+    'rini', 'riska', 'rosa', 'salsabila', 'sarah', 'sinta', 'siti', 'sri', 'suci', 'tari',
+    'tika', 'tiara', 'ulfa', 'vina', 'wati', 'widya', 'yanti', 'yunita', 'zahra', 'zulfah',
+];
+
+const NAMA_BELAKANG = [
+    'amsyah', 'andrian', 'ansori', 'ardianto', 'arifin', 'ariyanto', 'atmaja', 'basuki', 'budiman', 'cahyono',
+    'darmawan', 'dermawan', 'efendi', 'fadillah', 'fahmi', 'fauzan', 'febrian', 'fitriani', 'gunawan', 'hakim',
+    'hamzah', 'handoko', 'haryanto', 'hermawan', 'hidayat', 'hidayatullah', 'husein', 'ibrahim', 'ilyas', 'ismail',
+    'jatmiko', 'junaedi', 'kartono', 'kasim', 'kosasih', 'kristianto', 'kurniawan', 'kusuma', 'laksana', 'lubis',
+    'maulana', 'mulyadi', 'mulyono', 'mustafa', 'nasution', 'nugroho', 'nurhidayah', 'pamungkas', 'pangestu', 'prasetyo',
+    'pratama', 'priyanto', 'putra', 'putranto', 'rachman', 'rahardjo', 'rahman', 'rahmanto', 'rahmawati', 'ramadan',
+    'riyadi', 'riyanto', 'rohman', 'saputra', 'saputro', 'sari', 'setiawan', 'setiawati', 'siregar', 'siswanto',
+    'sitompul', 'sudrajat', 'sugiarto', 'sugiyanto', 'suharto', 'sulaiman', 'sulistyo', 'sumardi', 'suprapto', 'surya',
+    'susanto', 'sutrisno', 'syahputra', 'syahril', 'syahroni', 'tanjung', 'utama', 'utomo', 'wibowo', 'wicaksana',
+    'wicaksono', 'widodo', 'widyanto', 'wijanarko', 'wijaya', 'winata', 'wirawan', 'yudha', 'yusuf', 'zainudin',
+];
+
+function randomIndonesianUsername() {
+    const depan    = NAMA_DEPAN[Math.floor(Math.random() * NAMA_DEPAN.length)];
+    const belakang = NAMA_BELAKANG[Math.floor(Math.random() * NAMA_BELAKANG.length)];
+    const angka    = Math.floor(Math.random() * 9000) + 100;
+    const sep      = ['', '.', '_'][Math.floor(Math.random() * 3)];
+    return `${depan}${sep}${belakang}${angka}`;
+}
+
+
+/** Fetch available domains from jestco.id (cached) */
+let _jestcoDomains = [];
+async function getJestcoDomains() {
+    if (_jestcoDomains.length) return _jestcoDomains;
+    const res  = await fetch(`${JESTCO_API}?action=get_public_config&_t=${Date.now()}`, {
+        headers: JESTCO_HEADERS
+    });
+    const data = await res.json();
+    _jestcoDomains = data.domains || [];
+    return _jestcoDomains;
+}
+
+/**
+ * Generate a temp email address using jestco.id.
+ * No account creation needed — inbox accessible via email address directly.
+ * @returns {{ email: string }}
+ */
+async function createJestcoEmail() {
+    const domains = await getJestcoDomains();
+    if (!domains.length) throw new Error('[jestco] No domains available');
+    const domain   = domains[Math.floor(Math.random() * domains.length)];
+    const username = randomIndonesianUsername();
+    const email    = `${username}@${domain}`;
+    console.log(chalk.cyan(`[jestco] Temp email: ${email}`));
+    return { email };
+}
+
+/**
+ * Poll jestco.id inbox until a new message arrives.
+ * @param {string} email    - temp email address
+ * @param {number} retries  - max attempts
+ * @param {number} delayMs  - ms between attempts
+ * @returns {{ from, subject, body } | null}
+ */
+async function waitForJestcoMessage(email, retries = 20, delayMs = 5000) {
+    for (let i = 0; i < retries; i++) {
+        console.log(chalk.yellow(`[Inbox] Checking inbox... attempt ${i + 1}/${retries}`));
+
+        const res = await fetch(
+            `${JESTCO_API}?to=${encodeURIComponent(email)}&site_pass=&_t=${Date.now()}`,
+            { headers: JESTCO_HEADERS }
+        );
+        const messages = await res.json();
+
+        if (Array.isArray(messages) && messages.length > 0) {
+            const first   = messages[0];
+            const from    = first.from || first.sender || '';
+            const subject = first.subject || '';
+            const body    = first.body || first.text || first.html || first.content || JSON.stringify(first);
+            console.log(chalk.green(`[Inbox] Message received! From: ${from} | Subject: ${subject}`));
+            return { from, subject, body };
+        }
+
+        if (i < retries - 1) {
+            await new Promise(r => setTimeout(r, delayMs));
+        }
+    }
+    return null;
+}
+
+/**
+ * Extract OTP code (4-8 digit number) from email body text.
+ */
+function readOtpFromEmail(body) {
+    const patterns = [
+        /\b(\d{6})\b/,   // Most common: 6 digits
+        /\b(\d{4})\b/,   // 4 digits
+        /\b(\d{8})\b/,   // 8 digits
+        /OTP[:\s]+(\d{4,8})/i,
+        /code[:\s]+(\d{4,8})/i,
+        /kode[:\s]+(\d{4,8})/i,
+        /verif\w*[:\s]+(\d{4,8})/i,
+    ];
+
+    for (const pattern of patterns) {
+        const match = body.match(pattern);
+        if (match) {
+            const digits = (match[1] || match[0]).replace(/\D/g, '');
+            if (digits.length >= 4 && digits.length <= 8) {
+                return digits;
+            }
+        }
+    }
+    return null;
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────     
+
+(async () => {
+    await checkCaptchaBalance();
+
+    ngocok: while(true) {
+        try {
+            // 1. Buat temp email baru via jestco.id (tanpa perlu daftar akun)
+            const { email } = await createJestcoEmail();
+
+            // 2. Get mpj cookie & CSRF
+            const gettingCookie = await getCookie();
+            if (gettingCookie.data.includes('This may occur when unusual or automated activity is detected.')) {
+                console.log(chalk.red('[mpj] Rate limited, tunggu 30s...'));
+                await new Promise(r => setTimeout(r, 30000));
+                continue ngocok;
+            }
+            const cleanedCookies = gettingCookie.headers.map(cookie => cookie.split(';')[0]);
+            let cookie = cleanedCookies.join('; ');
+
+            // Validasi CSRF tersedia — jika tidak ada, proxy gagal atau mpj block
+            if (!cookie.includes('csrf-token=')) {
+                console.log(chalk.red('[mpj] CSRF token tidak ditemukan (proxy gagal/block). Retry...'));
+                await new Promise(r => setTimeout(r, 5000));
+                continue ngocok;
+            }
+            let csrf = cookie.split('csrf-token=')[1].split(';')[0];
+
+
+            console.log(chalk.blue(`[mpj] Sending OTP to: ${email}`));
+
+            // 3. Kirim OTP ke temp email via mpj
+            const sendingEmail = await sendEmail(cookie, csrf, email);
+            console.log(chalk.green(`[mpj] OTP send response:`), JSON.stringify(sendingEmail.data));
+
+            if (!sendingEmail.data || sendingEmail.data.status !== true) {
+                const isRateLimit = sendingEmail.data?.status_code === 429;
+                console.log(chalk.red(`[mpj] Failed: ${sendingEmail.data?.message || 'unknown error'}. ${isRateLimit ? 'Rate limited, tunggu 30s...' : 'Retrying...'}` ));
+                await new Promise(r => setTimeout(r, isRateLimit ? 30000 : 2000));
+                continue ngocok;
+            }
+
+            // 4. Tunggu email OTP masuk ke jestco.id (max ~100 detik)
+            console.log(chalk.yellow('[Inbox] Waiting for OTP email...'));
+            const msg = await waitForJestcoMessage(email, 20, 5000);
+
+            if (!msg) {
+                console.log(chalk.red('[Inbox] No email received within timeout. Retrying...'));
+                continue ngocok;
+            }
+
+            // 5. Ekstrak OTP dari body email
+            const fullText = `${msg.subject} ${msg.body}`;
+            const otp = readOtpFromEmail(fullText);
+
+            if (!otp) {
+                console.log(chalk.red('[OTP] Could not extract OTP code.'));
+                console.log(chalk.gray('[OTP] Email body:'), fullText.slice(0, 300));
+                continue ngocok;
+            }
+
+            console.log(chalk.green(`[OTP] ✅ OTP Code: ${otp}`));
+
+            // 6. Verify OTP ke mpj
+            console.log(chalk.blue('[mpj] Verifying OTP...'));
+            const verifyRes = await verifyOtp(cookie, csrf, email, otp);
+            console.log(chalk.green('[mpj] Verify response:'), JSON.stringify(verifyRes));
+
+            if (!verifyRes || verifyRes.status !== true) {
+                console.log(chalk.red(`[mpj] OTP verify failed: ${verifyRes?.message || 'unknown'}. Retrying...`));
+                await new Promise(r => setTimeout(r, 2000));
+                continue ngocok;
+            }
+
+            // 7. Register akun mpj dengan data random
+            const userData = randomUserData(email);
+            console.log(chalk.blue(`[mpj] Registering: ${userData.name} | ${userData.mobile_no} | ${userData.birthdate}`));
+            const regRes = await registerAccount(cookie, csrf, email, otp, userData);
+            console.log(chalk.green('[mpj] Register response:'), JSON.stringify(regRes));
+
+            if (regRes && regRes.status === true) {
+                const mbr = regRes.MBR_CRD_NO || '-';
+
+                // 8. Login setelah register berhasil (solve captcha dulu via 2captcha)
+                let loginToken = '-';
+                let loginOk = false;
+                try {
+                    console.log(chalk.blue('[mpj] Solving captcha for login via 2captcha...'));
+                    const captchaResponse = await solveRecaptcha("6LdPw1kUAAAAANnq6qTKBXXUyFzbZbjXdQkZt_4m", "https://www.mpj.id/en/user/login");
+                    console.log(chalk.blue('[mpj] Logging in with captcha token...'));
+                    const loginRes = await loginmpj(cookie, csrf, email, "dowercorp@123", captchaResponse);
+                    console.log(chalk.green('[mpj] Login response:'), JSON.stringify(loginRes.data));
+
+                    const sessionCookie = (loginRes.cookies || [])
+                        .map(c => c.split(';')[0])
+                        .find(c => c.includes('mpj_session') || c.includes('PHPSESSID') || c.includes('session'));
+
+                    loginToken = loginRes.data?.token || loginRes.data?.access_token || sessionCookie || '-';
+                    loginOk    = loginRes.data?.status === true || !!loginRes.data?.token || loginRes.data?.status_code === 200;
+
+                    // Update cookie dengan cookies baru dari response login
+                    if (loginRes.cookies && loginRes.cookies.length > 0) {
+                        const newCookies = loginRes.cookies.map(c => c.split(';')[0]);
+                        const merged = new Map();
+                        cookie.split(';').forEach(c => {
+                            const [k, ...v] = c.trim().split('=');
+                            if (k) merged.set(k, v.join('='));
+                        });
+                        newCookies.forEach(c => {
+                            const [k, ...v] = c.trim().split('=');
+                            if (k) merged.set(k, v.join('='));
+                        });
+                        cookie = Array.from(merged.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+                        if (merged.has('csrf-token')) csrf = merged.get('csrf-token');
+                    }
+
+                    // 9. Register Coupon jika login berhasil dan memiliki token
+                    if (loginOk && loginRes.data?.token) {
+                        code: while(true) {
+                            const couponCode = generateCode()
+                            console.log(chalk.blue(`[mpj] Registering coupon: ${couponCode}...`));
+                            const couponRes = await registerCoupon(cookie, csrf, loginRes.data.token, couponCode);
+
+                            if (couponRes && (couponRes.status_code === 200 || couponRes.message === 'OK')) {
+                                console.log(chalk.bgGreen.black(`${getTimestamp()} [Coupon] ✅ Berhasil claim kupon: ${couponCode} di akun ${email} | Password: dowercorp@123`));
+                                fs.appendFileSync('./success_coupons.txt', `${email}|dowercorp@123|${couponCode}\n`);
+                            } else {
+                                const errMsg = couponRes?.message || 'Invalid Coupon';
+                                console.log(chalk.red(`${getTimestamp()} [Coupon] ❌ Gagal claim kupon (${couponRes?.status_code || 422}): ${errMsg}`));
+                                continue code;
+                            }
+                        }
+                    }
+                } catch (captchaErr) {
+                    console.log(chalk.red(`[mpj] Captcha / Login error: ${captchaErr.message}`));
+                }
+
+                const line = `${email}|dowercorp@123|${userData.name}|${userData.mobile_no}|${mbr}|${loginToken}`;
+                fs.appendFileSync('./accounts.txt', line + '\n');
+                console.log(chalk.bgGreen.black(`[✅ SUCCESS] ${email} | MBR: ${mbr} | Login: ${loginOk ? 'OK' : 'FAILED (akun tersimpan)'}`));
+            } else {
+                console.log(chalk.red(`[mpj] Register failed: ${regRes?.message || 'unknown'}. Retrying...`));
+                await new Promise(r => setTimeout(r, 2000));
+                continue ngocok;
+            }
+
+        } catch (err) {
+            console.error(chalk.red('[Error]'), err.message || err);
+            await new Promise(r => setTimeout(r, 5000));
+        }
+    }
+})();
+
+function generateCode() {
+  const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const numbers = '0123456789';
+
+  const randomLetter = () =>
+    letters[Math.floor(Math.random() * letters.length)];
+
+  const randomNumber = () =>
+    numbers[Math.floor(Math.random() * numbers.length)];
+
+  return `mpjMOV${randomLetter()}${randomLetter()}${randomLetter()}${randomNumber()}${randomNumber()}COLA`;
+}
+
+function getTimestamp() {
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const hours = pad(now.getHours());
+    const minutes = pad(now.getMinutes());
+    const seconds = pad(now.getSeconds());
+    return `[${hours}:${minutes}:${seconds}]`;
+}
