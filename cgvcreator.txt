@@ -29,11 +29,11 @@ let config = {
 };
 
 try {
-    const rawConfig = fs.readFileSync('./configmpj.json', 'utf8');
+    const rawConfig = fs.readFileSync('./configcgv.json', 'utf8');
     config = { ...config, ...JSON.parse(rawConfig) };
-    console.log(chalk.green('[Config] Loaded settings dari configmpj.json'));
+    console.log(chalk.green('[Config] Loaded settings dari configcgv.json'));
 } catch (_) {
-    console.log(chalk.yellow('[Config] configmpj.json tidak ditemukan — menggunakan default'));
+    console.log(chalk.yellow('[Config] configcgv.json tidak ditemukan — menggunakan default'));
 }
 
 console.log()
@@ -46,9 +46,9 @@ let PROXIES = (config.proxies || [])
     .map(l => l.includes('://') ? l : `http://${l}`);
 
 if (PROXIES.length) {
-    console.log(chalk.green(`[Proxy] Loaded ${PROXIES.length} proxies dari configmpj.json`));
+    console.log(chalk.green(`[Proxy] Loaded ${PROXIES.length} proxies dari configcgv.json`));
 } else {
-    console.log(chalk.yellow('[Proxy] Tidak ada proxy di configmpj.json — berjalan tanpa proxy'));
+    console.log(chalk.yellow('[Proxy] Tidak ada proxy di configcgv.json — berjalan tanpa proxy'));
 }
 
 let proxyIndex = 0;
